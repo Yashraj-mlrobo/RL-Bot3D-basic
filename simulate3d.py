@@ -117,9 +117,9 @@ sun.look_at((env.grid_size/2, 0, env.grid_size/2))
 Sky() 
 
 try:
-    model = PPO.load("best_model1.zip")
+    model = PPO.load("best_model3.zip")
 except:
-    print("⚠️ WARNING: best_model1.zip not found!")
+    print("⚠️ WARNING: best_model3.zip not found!")
     model = None
 
 ui_status = Text(text="Bot is running facility sweep...", position=(-0.85, 0.45), scale=2, color=color.white, background=True)
@@ -182,8 +182,31 @@ simulation_running = True
 step_timer = 0
 trail_timer = 0
 
+# Add this global variable near the top of your script with the others if you haven't already
+# --- GLOBAL TRACKING VARIABLES ---
+recent_path = []
+escape_timer = 0
+phantom_walls_coords = []
+phantom_wall_entities = []
+
+# Physical Rewind & Sprint Variables
+is_rewinding = False
+rewind_path = []
+bad_path_memory = []
+override_steps = 0       
+override_direction = 0
+
 def update():
-    global obs, step_timer, trail_timer, simulation_running
+    global obs, step_timer, trail_timer, simulation_running, recent_path
+    global escape_timer, phantom_walls_coords, phantom_wall_entities
+    global is_rewinding, rewind_path, bad_path_memory
+    global override_steps, override_direction
+
+    # 1. Target Pulsing Effect
+    global pulse_timer
+    try: pulse_timer += time.dt * 3
+    except NameError: pulse_timer = 0
+    target_core.scale = 1.3 + (np.sin(pulse_timer) * 0.1)
 
     if not simulation_running or model is None:
         return
@@ -191,37 +214,138 @@ def update():
     step_timer += time.dt
     trail_timer += time.dt
     
-    # Breadcrumbs
+    # 2. Breadcrumbs
     if trail_timer > 0.5:
         trail_timer = 0
         breadcrumb = Entity(model='sphere', position=bot_parent.position, scale=0.25, color=color.cyan, alpha=0.8, origin_y=-0.5)
         trail_entities.append(breadcrumb)
-        for b in trail_entities:
-            b.alpha -= 0.15 * time.dt
-            b.scale -= 0.05 * time.dt
-            if b.alpha < 0.1:
-                trail_entities.remove(b)
-                destroy(b)
+
+    for b in trail_entities:
+        b.alpha -= 0.15 * time.dt
+        b.scale -= 0.05 * time.dt
+        if b.alpha < 0.1:
+            trail_entities.remove(b)
+            destroy(b)
                 
-    # AI Loop
-    if step_timer > 0.15: # Faster movement for hard mode
+    # --- 3. AI LOOP & MANEUVERS ---
+    if step_timer > 0.15: 
         step_timer = 0
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _, terminated, truncated, _ = env.step(action.item())
+        # --- THE BULLETPROOF FIX ---
+        # Default to False. They will only change to True if the AI actually takes a step!
+        terminated = False
+        truncated = False
+        # STATE A: THE FORCED SPRINT (Getting away from the trap)
+        if override_steps > 0:
+            action = override_direction
+            override_steps -= 1
+            ui_status.text = f"⚠️ Evasive Maneuver... ({override_steps})"
+            ui_status.color = color.orange
+            recent_path.clear() 
+            
+            # Take the forced step
+            obs, _, terminated, truncated, _ = env.step(action)
+            bot_parent.animate_position((env.bot_pos[0], 0, env.bot_pos[1]), duration=0.1, curve=curve.linear)
+            minimap_bot.position = (mm_offset + env.bot_pos[0]*mm_cell, mm_offset + env.bot_pos[1]*mm_cell)
+
+        # STATE B: THE PHYSICAL REWIND (Backing out of a dead end)
+        elif is_rewinding:
+            if len(rewind_path) > 0:
+                next_pos = rewind_path.pop(0)
+                env.prev_pos = env.bot_pos.copy()
+                env.bot_pos = np.array(next_pos)
+                
+                bot_parent.animate_position((env.bot_pos[0], 0, env.bot_pos[1]), duration=0.1, curve=curve.linear)
+                minimap_bot.position = (mm_offset + env.bot_pos[0]*mm_cell, mm_offset + env.bot_pos[1]*mm_cell)
+                ui_status.text = f"⚠️ Reversing... ({len(rewind_path)})"
+                ui_status.color = color.orange
+            else:
+                # Rewind finished. Drop Phantom Walls.
+                is_rewinding = False
+                for pos in bad_path_memory:
+                    if list(pos) != list(env.bot_pos):
+                        env.obstacles.append(np.array(pos)) 
+                        phantom_walls_coords.append(list(pos))
+                        pw = Entity(model='cube', color=color.rgba(255, 0, 0, 150), position=(pos[0], 0, pos[1]), scale=(1, 1.5, 1), origin_y=-0.5)
+                        phantom_wall_entities.append(pw)
+                
+                escape_timer = 15 
+                bad_path_memory.clear()
+                recent_path.clear()
+                obs = env._get_obs()
+                
+                # --- NEW: SCAN AND SPRINT ---
+                # Look for an open direction to run away from the trap
+                safe_directions = []
+                for a, (dx, dy) in enumerate([(0, 1), (0, -1), (-1, 0), (1, 0)]):
+                    test_pos = np.array([env.bot_pos[0] + dx, env.bot_pos[1] + dy])
+                    hit_wall = test_pos[0] < 0 or test_pos[0] >= env.grid_size or test_pos[1] < 0 or test_pos[1] >= env.grid_size
+                    hit_obs = any(np.array_equal(test_pos, o) for o in env.obstacles)
+                    if not hit_wall and not hit_obs:
+                        safe_directions.append(a)
+                
+                if safe_directions:
+                    override_direction = np.random.choice(safe_directions)
+                    override_steps = 3 # Sprint 3 blocks away!
+
+        # STATE C: NORMAL AI DRIVING
+        else:
+            recent_path.append(list(env.bot_pos))
+            if len(recent_path) > 12: recent_path.pop(0) 
+                
+            current_tile_count = recent_path[-8:].count(list(env.bot_pos))
+            is_stuck = current_tile_count >= 4 
+
+            # Detect Trap
+            if is_stuck and escape_timer == 0 and len(recent_path) >= 6:
+                print("⚠️ DEAD END DETECTED! Reversing and blocking path...")
+                is_rewinding = True
+                bad_path_memory = recent_path[-5:] 
+                rewind_path = list(reversed(recent_path[-6:-1])) 
+                recent_path.clear()
+                
+            else:
+                # Manage Phantom Walls
+                if escape_timer > 0:
+                    escape_timer -= 1
+                    ui_status.text = f"⚠️ Phantom Walls Active ({escape_timer})"
+                    ui_status.color = color.orange
+                    
+                    if escape_timer == 0:
+                        new_obstacles = []
+                        for o in env.obstacles:
+                            if not any(pw[0] == o[0] and pw[1] == o[1] for pw in phantom_walls_coords):
+                                new_obstacles.append(o)
+                        env.obstacles = new_obstacles
+                        
+                        for pw_ent in phantom_wall_entities: destroy(pw_ent)
+                        phantom_walls_coords.clear()
+                        phantom_wall_entities.clear()
+                        obs = env._get_obs() 
+                else:
+                    ui_status.text = "Bot is running facility sweep..."
+                    ui_status.color = color.white
+
+                # AI takes the wheel
+                action_tensor, _ = model.predict(obs, deterministic=True)
+                action = action_tensor.item()
+                obs, _, terminated, truncated, _ = env.step(action)
+                
+                bot_parent.animate_position((env.bot_pos[0], 0, env.bot_pos[1]), duration=0.1, curve=curve.linear)
+                minimap_bot.position = (mm_offset + env.bot_pos[0]*mm_cell, mm_offset + env.bot_pos[1]*mm_cell)
         
-        bot_parent.animate_position((env.bot_pos[0], 0, env.bot_pos[1]), duration=0.1, curve=curve.linear)
-        
-        # Update Minimap Bot Position
-        minimap_bot.position = (mm_offset + env.bot_pos[0]*mm_cell, mm_offset + env.bot_pos[1]*mm_cell)
-        
-        if terminated:
-            ui_status.text = "✅ Facility Scan Complete."
-            ui_status.color = color.lime
-            simulation_running = False
-        elif truncated:
-            ui_status.text = "🔋 Low Battery. Trap Detected."
-            ui_status.color = color.red
-            simulation_running = False
+            # --- END OF MAZE CHECKS --- (Properly Indented!)
+            if terminated:
+                ui_status.text = "✅ Facility Scan Complete."
+                ui_status.color = color.lime
+                simulation_running = False
+                escape_timer = 0
+            elif truncated:
+                ui_status.text = "🔋 Low Battery. Trap Detected."
+                ui_status.color = color.red
+                simulation_running = False
+                escape_timer = 0
+                
+    
 
 # --- 7. RESTART ---
 def input(key):
