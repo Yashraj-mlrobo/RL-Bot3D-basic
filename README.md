@@ -53,4 +53,4 @@ python simulate3d.py
 ```
 (Press 'R' during the simulation to instantly generate a new procedural maze).
 
-Developed by Yash Raj Bhatnagar | Amity University Mumbai
+Developed by Yash Raj Bhatnagar
